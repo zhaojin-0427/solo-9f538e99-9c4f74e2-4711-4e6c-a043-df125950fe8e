@@ -23,7 +23,7 @@ FastAPI 实例完成这件事，全程使用有理数精确运算（`fractions.F
 | 实例 | 端口 | 接口 | 职责 |
 |---|---|---|---|
 | package-builder | 8001 | `POST /build`，文档 `/docs` | 输入新旧区号及各自覆盖街块，输出 JSON 交接包 |
-| converter | 8002 | `POST /convert`，文档 `/docs` | 输入交接包与本次有数的旧区人数，输出新区人数 |
+| converter | 8002 | `POST /convert`、`POST /convert/batch`，文档 `/docs` | 输入交接包与本次有数的旧区人数，输出新区人数；或整表批量换算历年人口分组表 |
 
 ### 交接包内容（不含任何街块编号或逐块归属）
 
@@ -75,6 +75,42 @@ FastAPI 实例完成这件事，全程使用有理数精确运算（`fractions.F
 }
 ```
 
+### 整表批量换算（converter，`POST /convert/batch`）
+
+历年人口分组表换成新区口径后需要整表入仓时，在换算端的
+`/docs` 打开 `POST /convert/batch`，以 `multipart/form-data` 上传两个文件：
+
+- `package`：v1 交接包（`/build` 输出的 JSON，`schema_version` 必须为 1）；
+- `table`：UTF-8 CSV（可带 BOM）。首列必须是 `row_id`，其余列与包内
+  旧区号一一对应（按列名匹配，顺序不限）。**空白单元格表示缺报，
+  `0` 表示实报**；实报值必须是非负整数。
+
+规模上限：10 万行；旧区、新区各至多 40 个；全表实报区组合至多 8 种。
+表格按行流式处理，内存占用不随行数增长。
+
+- **规则复用**：同一实报区组合的换算规则只准备一次（线性方程组只解
+  一次），每行仍用自己的非负整数人数逐行精确换算；响应头
+  `X-Rule-Preparations` 给出本次规则准备次数；
+- **口径一致**：校验与换算完全复用 `/convert` 的引擎（旧区等式校验、
+  负数/非整数结果即失败）；
+- **成功**（HTTP 200）：当次下载 CSV，保留原行序与 `row_id`，新区列
+  按包内顺序排列，无法推出的格留空；
+- **失败**（HTTP 400，只返回错误体）：`invalid_input` 表示输入不合规，
+  `conversion_failed` 表示换算失败；涉及具体行时 `detail` 指出记录序号
+  （首个数据行为第 1 条）及 `row_id`。
+
+示例：
+
+```bash
+curl -OJ -X POST http://localhost:8002/convert/batch \
+  -F "package=@package.json;type=application/json" \
+  -F "table=@history.csv;type=text/csv"
+# 响应头: X-Rule-Preparations: 3
+# converted.csv: row_id,N1,N2,...（无法推出的格留空）
+```
+
+原 `POST /convert` 的 JSON 调用方式不受影响，照常使用。
+
 ## Docker Compose 启动
 
 ```bash
@@ -101,7 +137,10 @@ pytest -q
    保存返回的交接包 JSON；
 2. 在 `http://localhost:8002/docs` 的 `POST /convert` 提交该交接包与
    当期已有旧区人数（非负整数），当次得到可精确推出的新区人数、
-   带分数系数的算式，以及缺资料新区列表。
+   带分数系数的算式，以及缺资料新区列表；
+3. 历年分组表整表入仓时，在 `http://localhost:8002/docs` 的
+   `POST /convert/batch` 上传同一交接包与 UTF-8 CSV，整批通过后
+   当次下载新区口径的 CSV。
 
 ## 目录结构
 
@@ -110,10 +149,11 @@ app/
   rationals.py      # 精确有理线性代数（RREF、零空间、线性方程组）
   expressions.py    # 分数与算式格式化
   models.py         # Pydantic 请求/响应模型与校验
-  engine.py         # 交接包生成与换算的纯领域逻辑
+  engine.py         # 交接包生成、规则准备与换算的纯领域逻辑
+  batch.py          # 整表批量换算（流式读写、按实报组合缓存规则）
   builder_app.py    # 实例 1：/build
-  converter_app.py  # 实例 2：/convert
-tests/              # 14 个端到端测试（TestClient）
+  converter_app.py  # 实例 2：/convert、/convert/batch
+tests/              # 45 个端到端测试（TestClient）
 Dockerfile
 docker-compose.yml
 ```
